@@ -56,13 +56,8 @@ mod simulations {
         let _ = env_logger::builder().is_test(true).try_init();
     }
 
-    /// Creates a new LiteSVM instance configured with:
-    /// - Necessary helper programs loaded from `programs/`
-    /// - A funded system account for signing transactions
-    ///
-    /// Integrators should update the programs loaded here for their own tests.
-    pub fn setup_litesvm() -> (LiteSVM, Keypair) {
-        let mut litesvm = LiteSVM::new().with_compute_budget(ComputeBudget {
+    pub fn setup_litesvm_base() -> (LiteSVM, Keypair) {
+        let litesvm = LiteSVM::new().with_compute_budget(ComputeBudget {
             compute_unit_limit: 1_400_000,
             ..Default::default()
         })
@@ -70,21 +65,6 @@ mod simulations {
         .with_sigverify(false)
         .with_transaction_history(0);
 
-        // These two programs appear to be dependencies required by Raydium
-        // CLMM math or helper operations.
-        let spl_calc_program = pubkey!("sspUE1vrh7xRoXxGsg7vR1zde2WdGtJRbyK9uRumBDy");
-        let spl_calc_path = format!("programs/{}.so", spl_calc_program);
-        litesvm
-            .add_program_from_file(spl_calc_program, spl_calc_path)
-            .unwrap();
-
-        let spl_calc_program_2 = pubkey!("ssmbu3KZxgonUtjEMCKspZzxvUQCxAFnyh1rcHUeEDo");
-        let spl_calc_path_2 = format!("programs/{}.so", spl_calc_program_2);
-        litesvm
-            .add_program_from_file(spl_calc_program_2, spl_calc_path_2)
-            .unwrap();
-
-        // Create a funded user wallet.
         let keypair = Keypair::new();
         let account = Account {
             lamports: 10_000 * LAMPORTS_PER_SOL,
@@ -93,8 +73,25 @@ mod simulations {
             executable: false,
             rent_epoch: 0,
         };
+        let mut litesvm = litesvm;
         litesvm
             .set_account(keypair.pubkey(), account.into())
+            .unwrap();
+
+        (litesvm, keypair)
+    }
+
+    pub fn setup_litesvm() -> (LiteSVM, Keypair) {
+        let (mut litesvm, keypair) = setup_litesvm_base();
+
+        let spl_calc_program = pubkey!("sspUE1vrh7xRoXxGsg7vR1zde2WdGtJRbyK9uRumBDy");
+        litesvm
+            .add_program_from_file(spl_calc_program, format!("programs/{}.so", spl_calc_program))
+            .unwrap();
+
+        let spl_calc_program_2 = pubkey!("ssmbu3KZxgonUtjEMCKspZzxvUQCxAFnyh1rcHUeEDo");
+        litesvm
+            .add_program_from_file(spl_calc_program_2, format!("programs/{}.so", spl_calc_program_2))
             .unwrap();
 
         (litesvm, keypair)
@@ -142,17 +139,15 @@ mod simulations {
         // Create synthetic token accounts inside the simulator
         //
 
-        // Token A account (source)
-        let mut account_a = Account::new(LAMPORTS_PER_SOL, TokenAccount::LEN, &spl_token::ID);
+        let mut account_a = Account::new(LAMPORTS_PER_SOL, TokenAccount::LEN, &token_a_program);
         let mut account_a_data = TokenAccount::default();
         account_a_data.mint = token_a;
         account_a_data.owner = keypair.pubkey();
         account_a_data.state = AccountState::Initialized;
-        account_a_data.amount = u64::MAX; // ensure "infinite" input
+        account_a_data.amount = u64::MAX;
         account_a_data.pack_into_slice(account_a.data_as_mut_slice());
 
-        // Token B account (destination)
-        let mut account_b = Account::new(LAMPORTS_PER_SOL, TokenAccount::LEN, &spl_token::ID);
+        let mut account_b = Account::new(LAMPORTS_PER_SOL, TokenAccount::LEN, &token_b_program);
         let mut account_b_data = TokenAccount::default();
         account_b_data.mint = token_b;
         account_b_data.owner = keypair.pubkey();
@@ -546,7 +541,128 @@ mod simulations {
     }
 
     // -------------------------------------------------------------------------
-    // Test 5: Omnipair AMM Monotonicity
+    // Test 5: Omnipair boundary simulation
+    // -------------------------------------------------------------------------
+
+    #[rstest]
+    #[tokio::test]
+    #[case("Cp2nGCWWfqkUmPR3pPKoR376Fti8wuYRFrSWJZq1a9SA")]
+    async fn test_omnipair_bound_simulation(#[case] pair_key: Pubkey) {
+        init_test_logger();
+
+        let rpc = RpcClient::new(solana_rpc_url());
+        let pair_account = rpc.get_account(&pair_key).await.unwrap();
+
+        let cache = RpcClientCache::new(rpc);
+        let mut venue = OmnipairVenue::from_account(&pair_key, &pair_account).unwrap();
+        venue.update_state(&cache).await.unwrap();
+
+        let (mut litesvm, keypair) = setup_litesvm_base();
+        litesvm
+            .add_program_from_file(
+                titan_integration_template::example::OMNIPAIR_PROGRAM_ID,
+                "programs/omnixgS8fnqHfCcTGKWj6JtKjzpJZ1Y5y9pyFkQDkYE.so",
+            )
+            .unwrap();
+
+        let latest_clock = cache.get_account(&clock::ID).await.unwrap();
+        let latest_clock: Clock = latest_clock
+            .as_ref()
+            .ok_or(TradingVenueError::NoAccountFound(clock::ID.into()))
+            .unwrap()
+            .deserialize_data()
+            .unwrap();
+        litesvm.set_sysvar::<Clock>(&latest_clock);
+
+        let tradable_mints = venue.get_token_info();
+        assert_eq!(tradable_mints.len(), 2);
+
+        const SIM_UPPER_CAP: u64 = 1_000_000_000_000_000;
+
+        for (in_idx, out_idx) in [(0, 1), (1, 0)] {
+            let (lower, upper) = venue.bounds(in_idx as u8, out_idx as u8).unwrap();
+            let capped_upper = upper.min(SIM_UPPER_CAP);
+
+            for bound in [lower, capped_upper] {
+                let request = QuoteRequest {
+                    input_mint: venue.get_token(in_idx).unwrap().pubkey,
+                    output_mint: venue.get_token(out_idx).unwrap().pubkey,
+                    amount: bound,
+                    swap_type: SwapType::ExactIn,
+                };
+
+                let sim =
+                    sim_quote_request(&venue, &cache, request.clone(), &mut litesvm, &keypair)
+                        .await;
+                let quote = venue.quote(request).unwrap();
+
+                assert_eq!(quote.expected_output.abs_diff(sim), 0);
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 6: Omnipair random sampling simulation
+    // -------------------------------------------------------------------------
+
+    #[rstest]
+    #[tokio::test]
+    #[case("Cp2nGCWWfqkUmPR3pPKoR376Fti8wuYRFrSWJZq1a9SA")]
+    async fn test_omnipair_random_samples(#[case] pair_key: Pubkey) {
+        init_test_logger();
+
+        let rpc = RpcClient::new(solana_rpc_url());
+        let pair_account = rpc.get_account(&pair_key).await.unwrap();
+
+        let cache = RpcClientCache::new(rpc);
+        let mut venue = OmnipairVenue::from_account(&pair_key, &pair_account).unwrap();
+        venue.update_state(&cache).await.unwrap();
+
+        let (mut litesvm, keypair) = setup_litesvm_base();
+        litesvm
+            .add_program_from_file(
+                titan_integration_template::example::OMNIPAIR_PROGRAM_ID,
+                "programs/omnixgS8fnqHfCcTGKWj6JtKjzpJZ1Y5y9pyFkQDkYE.so",
+            )
+            .unwrap();
+
+        let latest_clock = cache.get_account(&clock::ID).await.unwrap();
+        let latest_clock: Clock = latest_clock
+            .as_ref()
+            .ok_or(TradingVenueError::NoAccountFound(clock::ID.into()))
+            .unwrap()
+            .deserialize_data()
+            .unwrap();
+        litesvm.set_sysvar::<Clock>(&latest_clock);
+
+        const SIM_UPPER_CAP: u64 = 1_000_000_000_000_000;
+
+        for (in_idx, out_idx) in [(0, 1), (1, 0)] {
+            let (lb, ub) = venue.bounds(in_idx, out_idx).unwrap();
+            let capped_ub = ub.min(SIM_UPPER_CAP);
+
+            for _ in 0..50 {
+                let amount = sample_log_uniform_u64(lb, capped_ub);
+
+                let request = QuoteRequest {
+                    input_mint: venue.get_token(in_idx as usize).unwrap().pubkey,
+                    output_mint: venue.get_token(out_idx as usize).unwrap().pubkey,
+                    amount,
+                    swap_type: SwapType::ExactIn,
+                };
+
+                let sim =
+                    sim_quote_request(&venue, &cache, request.clone(), &mut litesvm, &keypair)
+                        .await;
+                let quote = venue.quote(request).unwrap();
+
+                assert_eq!(quote.expected_output.abs_diff(sim), 0);
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 7: Omnipair AMM Monotonicity
     // -------------------------------------------------------------------------
 
     #[rstest]
@@ -611,7 +727,7 @@ mod simulations {
     }
 
     // -------------------------------------------------------------------------
-    // Test 6: Omnipair quoting speed
+    // Test 9: Omnipair quoting speed
     // -------------------------------------------------------------------------
 
     #[rstest]
